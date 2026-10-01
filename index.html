@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=240, initial-scale=1.0, user-scalable=no">
+<title>Tower</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body { width:240px; height:282px; overflow:hidden; background:#0b0e14; color:#e8ecf4;
+    font-family:-apple-system,"Helvetica Neue",Arial,sans-serif; }
+  #hdr { padding:10px 12px 6px; border-bottom:1px solid #1d2534; }
+  #code { font-size:26px; font-weight:700; letter-spacing:2px; color:#fff; }
+  #code .live { display:inline-block; width:8px; height:8px; border-radius:50%;
+    background:#3a4356; margin-left:8px; vertical-align:middle; }
+  #code .live.on { background:#ff4444; animation:blink 1.2s infinite; }
+  @keyframes blink { 50% { opacity:.35; } }
+  #name { font-size:11px; color:#8b96ad; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #status { padding:6px 12px; font-size:12px; color:#7fd08f; min-height:28px; }
+  #status.tuning { color:#e8c547; }
+  #status.err { color:#ff7b7b; }
+  #list { height:132px; overflow:hidden; padding:2px 0; }
+  .row { padding:5px 12px; font-size:13px; color:#aeb8cc; white-space:nowrap;
+    overflow:hidden; text-overflow:ellipsis; }
+  .row.sel { background:#16202f; color:#fff; border-left:3px solid #2E9BFF; padding-left:9px; }
+  .row .sub { color:#6b768c; font-size:11px; }
+  .row.playing { color:#7fd08f; }
+  #help { padding:6px 12px 0; font-size:10px; line-height:1.5; color:#5b6579;
+    border-top:1px solid #1d2534; }
+  #help b { color:#8b96ad; font-weight:600; }
+</style>
+</head>
+<body>
+  <div id="hdr">
+    <div id="code">---<span class="live" id="livedot"></span></div>
+    <div id="name">tuning…</div>
+  </div>
+  <div id="status">starting…</div>
+  <div id="list"></div>
+  <div id="help">
+    <b>wheel</b> scroll &nbsp; <b>click</b> play/stop<br>
+    <b>2&times;click</b> airports/feeds &nbsp; <b>hold</b> say airport
+  </div>
+
+<script src="feeds.js"></script>
+<script>
+"use strict";
+/* Tower v1 — R1 airport ATC radio. LiveATC audio, 150 airports. */
+
+var HOSTS = ["https://s1-fmt2.liveatc.net/", "https://s1-bos.liveatc.net/", "https://d.liveatc.net/"];
+var ATTEMPT_MS = 9000;
+
+var view = "feeds";            // 'feeds' | 'airports'
+var apIdx = 0;                 // index into AIRPORTS
+var feedSel = 0;               // selected feed row
+var apSel = 0;                 // selected airport row
+var playingMount = null;
+var audio = new Audio();
+audio.preload = "none";
+
+var $code = document.getElementById("code"),
+    $name = document.getElementById("name"),
+    $status = document.getElementById("status"),
+    $list = document.getElementById("list"),
+    $livedot = document.getElementById("livedot");
+
+function ap() { return AIRPORTS[apIdx]; }
+
+function setStatus(txt, cls) {
+  $status.textContent = txt;
+  $status.className = cls || "";
+}
+
+function feedLabel(mount) {
+  var s = mount.toLowerCase();
+  var i = s.indexOf("_");
+  var rest = i >= 0 ? s.slice(i + 1) : s;
+  var map = { twr:"Tower", gnd:"Ground", app:"Approach", dep:"Departure",
+    atis:"ATIS", del:"Delivery", unicom:"Unicom", ctr:"Center", rdr:"Radar",
+    final:"Final", heli:"Heli", ops:"Ops", emerg:"Emergency", tw:"Tower",
+    arr:"Arrival", info:"Info", rmp:"Ramp", clearance:"Clearance" };
+  var parts = rest.split("_").map(function(p) {
+    var m = p.match(/^([a-z]+)(\d.*)?$/);
+    var base = m ? m[1] : p, num = m && m[2] ? m[2] : "";
+    var w = map[base] || (base.charAt(0).toUpperCase() + base.slice(1));
+    return num ? w + " " + num.replace(/^0+/, "") : w;
+  });
+  return parts.join(" ");
+}
+
+function render() {
+  var a = ap();
+  $code.innerHTML = a.c + '<span class="live' + (playingMount ? " on" : "") + '" id="livedot"></span>';
+  $name.textContent = a.n + (a.y ? " — " + a.y : "");
+  var html = "", rows, sel, i;
+  if (view === "feeds") {
+    rows = a.m; sel = feedSel;
+    for (i = 0; i < rows.length; i++) {
+      var cls = "row" + (i === sel ? " sel" : "") + (playingMount === rows[i] ? " playing" : "");
+      html += '<div class="' + cls + '">' + (playingMount === rows[i] ? "▶ " : "") +
+              feedLabel(rows[i]) + "</div>";
+    }
+  } else {
+    rows = AIRPORTS; sel = apSel;
+    var start = Math.max(0, Math.min(sel - 2, rows.length - 5));
+    for (i = start; i < Math.min(rows.length, start + 5); i++) {
+      html += '<div class="row' + (i === sel ? " sel" : "") + '">' + rows[i].c +
+              ' <span class="sub">' + (rows[i].y || rows[i].n) + "</span></div>";
+    }
+  }
+  $list.innerHTML = html;
+}
+
+function stopAudio(silent) {
+  try { audio.pause(); } catch (e) {}
+  try { audio.removeAttribute("src"); audio.load(); } catch (e) {}
+  playingMount = null;
+  if (!silent) { setStatus("stopped"); render(); }
+}
+
+/* Try mounts in order; for each, try hosts in order. First audible wins. */
+function tryPlay(mounts, mi, hostTriedNote) {
+  mi = mi || 0;
+  if (mi >= mounts.length) {
+    setStatus("no live feed right now", "err");
+    render();
+    return;
+  }
+  var mount = mounts[mi];
+  setStatus("tuning " + feedLabel(mount) + "…", "tuning");
+  render();
+  tryHost(mount, mounts, mi, 0);
+}
+
+function tryHost(mount, mounts, mi, hi) {
+  if (hi >= HOSTS.length) { tryPlay(mounts, mi + 1); return; }
+  var url = HOSTS[hi] + mount;
+  var done = false;
+  var timer = setTimeout(function() { if (!done) { done = true; next(); } }, ATTEMPT_MS);
+  function next() { clearTimeout(timer); cleanup(); tryHost(mount, mounts, mi, hi + 1); }
+  function cleanup() {
+    audio.removeEventListener("playing", onPlay);
+    audio.removeEventListener("error", onErr);
+  }
+  function onPlay() {
+    if (done) return; done = true;
+    clearTimeout(timer); cleanup();
+    playingMount = mount;
+    setStatus("▶ " + feedLabel(mount) + " — live");
+    render();
+    try { localStorage.setItem("tower.airport", ap().c); } catch (e) {}
+  }
+  function onErr() { if (!done) { done = true; next(); } }
+  audio.addEventListener("playing", onPlay);
+  audio.addEventListener("error", onErr);
+  try {
+    audio.src = url;
+    var p = audio.play();
+    if (p && p.catch) p.catch(function() {
+      /* autoplay blocked outside a gesture: leave selected, let user click */
+      if (!done) { done = true; clearTimeout(timer); cleanup(); stopAudio(true);
+        setStatus("tap click to play", "tuning"); render(); }
+    });
+  } catch (e) { next(); }
+}
+
+function togglePlay() {
+  var a = ap();
+  if (playingMount) { stopAudio(); return; }
+  tryPlay(a.m, feedSel);
+}
+
+function selectAirport(i) {
+  apIdx = i; apSel = i; feedSel = 0; view = "feeds";
+  stopAudio(true);
+  setStatus("stopped");
+  render();
+  try { localStorage.setItem("tower.airport", ap().c); } catch (e) {}
+}
+
+function toggleView() {
+  stopAudio(true);
+  view = (view === "feeds") ? "airports" : "feeds";
+  if (view === "airports") apSel = apIdx;
+  setStatus(view === "airports" ? "pick an airport" : "stopped");
+  render();
+}
+
+function scroll(d) {
+  if (view === "feeds") {
+    feedSel = Math.max(0, Math.min(ap().m.length - 1, feedSel + d));
+  } else {
+    apSel = Math.max(0, Math.min(AIRPORTS.length - 1, apSel + d));
+  }
+  render();
+}
+
+/* ---------- voice: hold side button, say the airport ---------- */
+var FILLER = /\b(airport|international|intl|field|municipal|regional)\b/g;
+
+function norm(s) { return s.toLowerCase().replace(FILLER, " ").replace(/[^a-z ]/g, " ").replace(/\s+/g, " ").trim(); }
+
+function matchAirport(transcript) {
+  var q = norm(transcript);
+  if (!q) return null;
+  var best = null, bestScore = 0, i, a;
+  var qnospace = q.replace(/ /g, "");
+  for (i = 0; i < AIRPORTS.length; i++) {
+    a = AIRPORTS[i];
+    var code = a.c.toLowerCase(), name = norm(a.n), city = norm(a.y || "");
+    var score = 0;
+    if (qnospace === code) score = 100;
+    else if (qnospace === "k" + code) score = 95;            // "kay ess ef oh"
+    else if (city && q === city) score = 85;
+    else if (name && name.indexOf(q) === 0) score = 70;      // "san francisco…"
+    else if (city && city.indexOf(q) === 0) score = 65;
+    else if (name && name.indexOf(q) >= 0) score = 50;
+    else if (city && city.indexOf(q) >= 0) score = 45;
+    if (score > bestScore) { bestScore = score; best = a; }
+  }
+  return best;
+}
+
+/* Fallback: airport not in the 150 — guess a LiveATC mount and probe it. */
+function guessMounts(transcript) {
+  var letters = transcript.toLowerCase().replace(/[^a-z]/g, "");
+  var out = [];
+  function push(m) { if (out.indexOf(m) < 0) out.push(m); }
+  if (letters.length === 3) {
+    push("k" + letters + "_twr"); push(letters + "_twr");
+    push("k" + letters + "_twr1"); push("k" + letters + "_gnd");
+  } else if (letters.length === 4) {
+    push(letters + "_twr"); push(letters + "_twr1"); push(letters + "_gnd");
+  }
+  return out;
+}
+
+var listening = false;
+
+function voiceStart() {
+  if (listening) return;
+  if (typeof CreationVoiceHandler === "undefined") {
+    setStatus("voice not available on this device", "err");
+    return;
+  }
+  listening = true;
+  stopAudio(true);
+  setStatus("listening… say an airport", "tuning");
+  render();
+  try { CreationVoiceHandler.postMessage("start"); } catch (e) { listening = false; }
+}
+
+function voiceStop() {
+  if (!listening) return;
+  try { CreationVoiceHandler.postMessage("stop"); } catch (e) { listening = false; }
+}
+
+window.onPluginMessage = function(data) {
+  if (!data || data.type !== "sttEnded") return;
+  listening = false;
+  var t = (data.transcript || "").trim();
+  if (!t) { setStatus("didn't catch that — try again", "err"); render(); return; }
+  var hit = matchAirport(t);
+  if (hit) {
+    var i = AIRPORTS.indexOf(hit);
+    apIdx = i; apSel = i; feedSel = 0; view = "feeds";
+    setStatus('"' + t + '" → ' + hit.c);
+    render();
+    tryPlay(hit.m, 0);   // straight to its tower
+    return;
+  }
+  var guesses = guessMounts(t);
+  if (guesses.length) {
+    /* temp entry so the UI has something to show */
+    var code3 = t.replace(/[^a-zA-Z]/g, "").toUpperCase().slice(-3) || "???";
+    AIRPORTS.unshift({ c: code3, n: t, y: "", m: guesses });
+    apIdx = 0; apSel = 0; feedSel = 0; view = "feeds";
+    setStatus('"' + t + '" not in list — trying guessed feed…', "tuning");
+    render();
+    tryPlay(guesses, 0);
+    return;
+  }
+  setStatus('no match for "' + t + '"', "err");
+  render();
+};
+
+/* ---------- input wiring ---------- */
+var clickTimer = null;
+function onSideClick() {
+  if (clickTimer) {                       // double-click → toggle view
+    clearTimeout(clickTimer); clickTimer = null;
+    toggleView(); return;
+  }
+  clickTimer = setTimeout(function() {
+    clickTimer = null;
+    if (view === "feeds") togglePlay();
+    else selectAirport(apSel);
+  }, 250);
+}
+
+window.addEventListener("sideClick", onSideClick);
+window.addEventListener("scrollUp", function() { scroll(-1); });
+window.addEventListener("scrollDown", function() { scroll(1); });
+window.addEventListener("longPressStart", voiceStart);
+window.addEventListener("longPressEnd", voiceStop);
+
+/* desktop testing fallbacks */
+document.addEventListener("keydown", function(e) {
+  if (e.key === "Escape") window.dispatchEvent(new Event("sideClick"));
+  if (e.key === "ArrowUp") window.dispatchEvent(new Event("scrollUp"));
+  if (e.key === "ArrowDown") window.dispatchEvent(new Event("scrollDown"));
+  if (e.key === " " && !e.repeat) window.dispatchEvent(new Event("longPressStart"));
+});
+document.addEventListener("keyup", function(e) {
+  if (e.key === " ") window.dispatchEvent(new Event("longPressEnd"));
+});
+
+/* ---------- boot ---------- */
+(function boot() {
+  var saved = null;
+  try { saved = localStorage.getItem("tower.airport"); } catch (e) {}
+  if (saved) {
+    for (var i = 0; i < AIRPORTS.length; i++) {
+      if (AIRPORTS[i].c === saved) { apIdx = i; apSel = i; break; }
+    }
+  } else {
+    for (var j = 0; j < AIRPORTS.length; j++) {
+      if (AIRPORTS[j].c === "SFO") { apIdx = j; apSel = j; break; }
+    }
+  }
+  setStatus("stopped");
+  render();
+})();
+</script>
+</body>
+</html>
